@@ -90,6 +90,11 @@ SHA-256: `68bc0630e20c481856e2e5e6703913278a912f2d288dbca8ba14bbb1eec6b529`
 
 ---
 
+## GitHub
+- Repo (private): https://github.com/SimonPetrus/SPCleaner — dal `main`.
+- Exe repoda değil, **Releases**'ta: v2.0.0 → `SPCleaner+.exe`. Yeni sürüm: `build.bat` → `gh release create vX.Y.Z "SPCleaner+.exe"`.
+- Dışarıda (`.gitignore`): `_Sohbet_Kaydi/`, `*.exe`, `*.log`. Repo public yapılırsa `RE_Analiz_EskiTempCleaner/` kaldırılmalı.
+
 ## Sohbet kaydı / devam etme
 - `_Sohbet_Kaydi/sohbet.jsonl` — bu çalışmanın tam konuşma kaydı.
 - VS Code'da **bu klasörü açıp** Claude Code'da `/resume` dersen bu oturum listede çıkar
