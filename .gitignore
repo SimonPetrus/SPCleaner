@@ -1,0 +1,11 @@
+# Kisisel / yayinlanmayacak
+_Sohbet_Kaydi/
+# Not: RE_Analiz_EskiTempCleaner/ (Sordum TempCleaner analizi) repo private oldugu icin dahil.
+# Repo public yapilirsa bu klasoru kaldir: telifli urunun cozulmus kodunu icerir.
+
+# Derleme ciktisi (exe GitHub Releases'a konur)
+*.exe
+
+# Calisma ciktisi
+*.log
+__pycache__/
