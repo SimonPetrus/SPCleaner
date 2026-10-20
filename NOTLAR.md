@@ -12,7 +12,7 @@ Son güncelleme: 2026-10-20
 ## 1) SPCleaner+ (asıl uygulamamız)
 
 ### Dosyalar
-- `SPCleaner+.exe` — çalışan uygulama, ürün adı "SPCleaner+", sürüm 2.2.0.0 (~64 KB, ikon gömülü, .NET Framework 4.8, x64)
+- `SPCleaner+.exe` — çalışan uygulama, ürün adı "SPCleaner+", sürüm 2.2.1.0 (~64 KB, ikon gömülü, .NET Framework 4.8, x64)
 - `SPCleaner+.cs` — tüm kaynak kod (tek dosya)
 - **Tek exe:** ayar dosyası (ini) yok, ayarlar exe içinde sabit; sadece komut satırı parametreleri değiştirir.
 - `app.manifest` — `asInvoker` → ikonda UAC kalkanı yok. Program açılışta kendini `runas` ile yeniden
@@ -44,7 +44,8 @@ Son güncelleme: 2026-10-20
   Status'u "Caching" dışında bir iş varsa (aktif indirme) atlanır, silmeden hemen önce tekrar bakılır. 7 gün kuralı yok
   (Windows bu dosyaları zaten birkaç günde siliyor).
 - **Ayrıntılar** (v2.2): iş bitince bildirimde düğme; tıklayınca kaynak başına satırlar (silinen/bulunan, atlananın nedeni).
-  Açıkken fare üstündeyse kapanmaz, fare çekilince 10 sn sonra kapanır. Log'a da "Kaynaklar:" bölümü yazılır.
+  Açıkken fare üstündeyse kapanmaz, fare çekilince 10 sn sonra kapanır. Taramada hiçbir şey bulunmayan kaynak
+  listede gösterilmez (`SourceStat.Empty`); atlananlar ve bulunup silinemeyenler (soluk "0 B") gösterilir. Log'a da "Kaynaklar:" bölümü yazılır.
 - **Silinen dosya + klasör sayısı** ve **boşalan alan (MB/GB)** gösterir.
 - **Bildirim penceresi (v2.1, Windows 11 tarzı):** sağ altta alttan kayarak açılır, odağı çalmaz; açık/koyu tema ve
   Windows vurgu rengine uyar; Win11 yerel yuvarlak köşe+gölge (DWM); durum simgesi (Segoe Fluent Icons), ince ilerleme
@@ -107,7 +108,7 @@ SHA-256: `68bc0630e20c481856e2e5e6703913278a912f2d288dbca8ba14bbb1eec6b529`
 
 ## GitHub
 - Repo (private): https://github.com/SimonPetrus/SPCleaner — dal `main`.
-- Exe repoda değil, **Releases**'ta: v2.0.0, v2.1.0 (yeni bildirim penceresi), v2.2.0 (Ayrıntılar, Windows Update + Teslim İyileştirme önbelleği) → `SPCleaner+.exe`. Yeni sürüm: `build.bat` → `gh release create vX.Y.Z "SPCleaner+.exe"`.
+- Exe repoda değil, **Releases**'ta: v2.0.0, v2.1.0 (yeni bildirim penceresi), v2.2.0 (Ayrıntılar, Windows Update + Teslim İyileştirme önbelleği), v2.2.1 (Ayrıntılar'da boş kaynaklar gizli) → `SPCleaner+.exe`. Yeni sürüm: `build.bat` → `gh release create vX.Y.Z "SPCleaner+.exe"`.
 - Dışarıda (`.gitignore`): `_Sohbet_Kaydi/`, `*.exe`, `*.log`. Repo public yapılırsa `RE_Analiz_EskiTempCleaner/` kaldırılmalı.
 
 ## Sohbet kaydı / devam etme

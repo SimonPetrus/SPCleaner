@@ -36,8 +36,8 @@ using Microsoft.Win32;
 [assembly: AssemblyTitle("SPCleaner+")]
 [assembly: AssemblyDescription("SPCleaner+ - Gecici dosya temizleyici")]
 [assembly: AssemblyProduct("SPCleaner+")]
-[assembly: AssemblyVersion("2.2.0.0")]
-[assembly: AssemblyFileVersion("2.2.0.0")]
+[assembly: AssemblyVersion("2.2.1.0")]
+[assembly: AssemblyFileVersion("2.2.1.0")]
 
 namespace SPCleanerPlus
 {
@@ -89,7 +89,12 @@ namespace SPCleanerPlus
         public string Label;
         public long Found;        // taramada bulunan boyut
         public long Freed;        // silinen boyut
+        public int Files;         // taramada bulunan dosya sayisi (0 baytlik dosyalar dahil)
         public string Skip;       // atlandiysa nedeni (or. "yönetici izni gerekli")
+
+        // taramada hicbir sey bulunmadi ve atlanmadi. Iki alana birden bakilir: Teslim Iyilestirme Found'u
+        // dosya saymadan doldurur, 0 baytlik dosyalar ise Files'i artirip Found'u artirmaz.
+        public bool Empty { get { return Skip == null && Found == 0 && Files == 0; } }
     }
 
     // ---------------------- Hedef ----------------------
@@ -315,6 +320,7 @@ namespace SPCleanerPlus
             _fileTargets.Add(t);
             TotalBytes += len;
             t.Source.Found += len;
+            t.Source.Files++;
         }
 
         private void Walk(string dir, int ageHours, Target t, Func<bool> cancel)
@@ -1176,6 +1182,8 @@ namespace SPCleanerPlus
             foreach (var src in _engine.Sources)
             {
                 long v = _s.Preview ? src.Found : src.Freed;
+                // bos kaynak listede gosterilmez; atlananlar (nedeniyle) ve bulunup silinemeyenler (soluk "0 B") gosterilir
+                if (src.Empty) continue;
                 _st.Rows.Add(new ToastRow
                 {
                     Label = src.Label,
