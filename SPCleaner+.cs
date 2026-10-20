@@ -15,6 +15,7 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Drawing.Text;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -31,8 +32,8 @@ using Microsoft.Win32;
 [assembly: AssemblyTitle("SPCleaner+")]
 [assembly: AssemblyDescription("SPCleaner+ - Gecici dosya temizleyici")]
 [assembly: AssemblyProduct("SPCleaner+")]
-[assembly: AssemblyVersion("2.0.0.0")]
-[assembly: AssemblyFileVersion("2.0.0.0")]
+[assembly: AssemblyVersion("2.1.0.0")]
+[assembly: AssemblyFileVersion("2.1.0.0")]
 
 namespace SPCleanerPlus
 {
@@ -506,20 +507,227 @@ namespace SPCleanerPlus
             int i = 0;
             while (b >= 1024 && i < u.Length - 1) { b /= 1024; i++; }
             string fmt = (i == 0) ? "0" : (b >= 100 ? "0" : "0.0");
-            return b.ToString(fmt, CultureInfo.InvariantCulture) + " " + u[i];
+            return b.ToString(fmt, CultureInfo.GetCultureInfo("tr-TR")) + " " + u[i];
         }
     }
 
-    // ---------------------- Pencere ----------------------
+    // ---------------------- Bildirim penceresi (Windows 11 tarzi) ----------------------
+    internal enum ToastPhase { Scanning, Cleaning, Done, AlreadyClean, Preview }
+
+    // Pencerede gosterilen her sey; cizim sadece bu durumdan yapilir (onizleme resmi de ayni kodla cizilir)
+    internal class ToastState
+    {
+        public ToastPhase Phase = ToastPhase.Scanning;
+        public string Headline = "Taranıyor…";
+        public string Detail = "";
+        public string BigValue = "";      // sag ust buyuk deger, or. "121 MB"
+        public string BigCaption = "";    // altindaki aciklama, or. "boşaldı"
+        public string Footnote = "";      // ek bilgi satiri (yeniden baslatma vb.)
+        public double Progress = -1;      // 0..1; -1 = belirsiz (kayan cubuk)
+        public float Marquee;             // belirsiz cubugun konumu 0..1
+        public bool Limited;              // "Sınırlı mod" rozeti
+        public bool CloseHover;
+    }
+
+    internal class ToastTheme
+    {
+        public bool Dark;
+        public Color Back, Border, Text, SubText, Track, Accent, OnAccent, Success, OnSuccess, HoverBack, PillBack, PillText;
+
+        // Windows'un acik/koyu tema ayari ve vurgu rengi
+        public static ToastTheme FromSystem()
+        {
+            bool dark = false;
+            Color? accent = null;
+            try
+            {
+                using (var k = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"))
+                {
+                    object v = k == null ? null : k.GetValue("AppsUseLightTheme");
+                    if (v is int) dark = (int)v == 0;
+                }
+                using (var k = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\DWM"))
+                {
+                    object v = k == null ? null : k.GetValue("AccentColor");
+                    if (v is int) { int a = (int)v; accent = Color.FromArgb(a & 0xFF, (a >> 8) & 0xFF, (a >> 16) & 0xFF); }
+                }
+            }
+            catch { }
+            return Create(dark, accent);
+        }
+
+        public static ToastTheme Create(bool dark, Color? accent)
+        {
+            var t = new ToastTheme { Dark = dark };
+            if (dark)
+            {
+                t.Back = Hex(0x2C2C2C); t.Border = Hex(0x424242); t.Text = Hex(0xFFFFFF); t.SubText = Hex(0xC5C5C5);
+                t.Track = Hex(0x484848); t.HoverBack = Hex(0x3B3B3B);
+                t.Accent = accent.HasValue ? Mix(accent.Value, Color.White, 0.45) : Hex(0x4CC2FF);
+                t.OnAccent = Hex(0x000000);
+                t.Success = Hex(0x6CCB5F); t.OnSuccess = Hex(0x000000);
+                t.PillBack = Hex(0x433519); t.PillText = Hex(0xFCE100);
+            }
+            else
+            {
+                t.Back = Hex(0xFBFBFB); t.Border = Hex(0xDEDEDE); t.Text = Hex(0x1B1B1B); t.SubText = Hex(0x5E5E5E);
+                t.Track = Hex(0xDADADA); t.HoverBack = Hex(0xEBEBEB);
+                t.Accent = accent.HasValue ? Mix(accent.Value, Color.Black, 0.1) : Hex(0x005FB8);
+                t.OnAccent = Hex(0xFFFFFF);
+                t.Success = Hex(0x0F7B0F); t.OnSuccess = Hex(0xFFFFFF);
+                t.PillBack = Hex(0xFFF4CE); t.PillText = Hex(0x9D5D00);
+            }
+            return t;
+        }
+
+        private static Color Hex(int rgb) { return Color.FromArgb((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF); }
+
+        private static Color Mix(Color a, Color b, double t)
+        {
+            return Color.FromArgb((int)(a.R + (b.R - a.R) * t), (int)(a.G + (b.G - a.G) * t), (int)(a.B + (b.B - a.B) * t));
+        }
+    }
+
+    internal static class ToastPainter
+    {
+        public const int W = 364, H = 122;   // 96 DPI'da piksel
+
+        private static readonly Dictionary<string, Font> _fonts = new Dictionary<string, Font>();
+
+        public static RectangleF CloseRect(float sc) { return new RectangleF((W - 40) * sc, 6 * sc, 32 * sc, 28 * sc); }
+
+        public static void Paint(Graphics g, ToastState st, ToastTheme th, float sc, Image appIcon, bool showClose)
+        {
+            Func<float, float> S = v => v * sc;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+            g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+            g.Clear(th.Back);
+
+            bool ok = st.Phase == ToastPhase.Done || st.Phase == ToastPhase.AlreadyClean;
+            Color stateColor = ok ? th.Success : th.Accent;
+
+            // ust satir: uygulama ikonu + adi (+ sinirli mod rozeti), sagda kapat
+            if (appIcon != null) g.DrawImage(appIcon, S(16), S(12), S(16), S(16));
+            Font cap = UiFont("Segoe UI", S(12));
+            Text(g, "SPCleaner+", cap, th.SubText, new RectangleF(S(40), S(10), S(200), S(20)), StringAlignment.Near);
+            if (st.Limited)
+            {
+                float capW = g.MeasureString("SPCleaner+", cap, PointF.Empty, StringFormat.GenericTypographic).Width;
+                Font pf = UiFont("Segoe UI Semibold", S(11));
+                string pt = "Sınırlı mod";
+                float pw = g.MeasureString(pt, pf, PointF.Empty, StringFormat.GenericTypographic).Width + S(14);
+                var pr = new RectangleF(S(40) + capW + S(8), S(11), pw, S(18));
+                using (var path = Round(pr, S(9))) using (var b = new SolidBrush(th.PillBack)) g.FillPath(b, path);
+                Text(g, pt, pf, th.PillText, pr, StringAlignment.Center);
+            }
+            if (showClose)
+            {
+                var cr = CloseRect(sc);
+                if (st.CloseHover) using (var path = Round(cr, S(4))) using (var b = new SolidBrush(th.HoverBack)) g.FillPath(b, path);
+                Text(g, "", IconFont(S(10)), st.CloseHover ? th.Text : th.SubText, cr, StringAlignment.Center);
+            }
+
+            // durum simgesi: renkli daire icinde Fluent ikonu
+            var circle = new RectangleF(S(16), S(42), S(32), S(32));
+            using (var b = new SolidBrush(stateColor)) g.FillEllipse(b, circle);
+            string glyph = st.Phase == ToastPhase.Scanning ? "" : st.Phase == ToastPhase.Cleaning ? "" : st.Phase == ToastPhase.Preview ? "" : "";
+            Text(g, glyph, IconFont(S(15)), ok ? th.OnSuccess : th.OnAccent, circle, StringAlignment.Center);
+
+            // sag: buyuk deger (bosalan / bulunan alan)
+            float bigW = 0, capW2 = 0;
+            if (st.BigValue.Length > 0)
+            {
+                Font bf = UiFont("Segoe UI Semibold", S(21));
+                bigW = g.MeasureString(st.BigValue, bf, PointF.Empty, StringFormat.GenericTypographic).Width;
+                Text(g, st.BigValue, bf, ok ? th.Success : th.Accent, new RectangleF(S(60), S(36), S(W - 76), S(30)), StringAlignment.Far);
+                Font cf = UiFont("Segoe UI", S(11.5f));
+                capW2 = g.MeasureString(st.BigCaption, cf, PointF.Empty, StringFormat.GenericTypographic).Width;
+                Text(g, st.BigCaption, cf, th.SubText, new RectangleF(S(60), S(64), S(W - 76), S(18)), StringAlignment.Far);
+            }
+
+            // orta: baslik + ayrinti + not
+            Text(g, st.Headline, UiFont("Segoe UI Semibold", S(15)), th.Text, new RectangleF(S(60), S(39), S(W - 76) - bigW - S(10), S(24)), StringAlignment.Near);
+            Text(g, st.Detail, UiFont("Segoe UI", S(12)), th.SubText, new RectangleF(S(60), S(63), S(W - 76) - capW2 - S(10), S(20)), StringAlignment.Near);
+            if (st.Footnote.Length > 0)
+                Text(g, st.Footnote, UiFont("Segoe UI", S(11.5f)), th.SubText, new RectangleF(S(60), S(81), S(W - 76), S(18)), StringAlignment.Near);
+
+            // alt: ince ilerleme cubugu
+            var track = new RectangleF(S(16), S(104), S(W - 32), S(4));
+            using (var path = Round(track, S(2))) using (var b = new SolidBrush(th.Track)) g.FillPath(b, path);
+            RectangleF fill;
+            if (st.Progress < 0)
+            {
+                float segW = track.Width * 0.3f;
+                float x = track.X - segW + (track.Width + segW) * st.Marquee;
+                fill = RectangleF.Intersect(track, new RectangleF(x, track.Y, segW, track.Height));
+            }
+            else fill = new RectangleF(track.X, track.Y, track.Width * (float)Math.Max(0, Math.Min(1, st.Progress)), track.Height);
+            if (fill.Width > 0.5f)
+                using (var path = Round(fill, Math.Min(S(2), fill.Width / 2))) using (var b = new SolidBrush(stateColor)) g.FillPath(b, path);
+        }
+
+        private static void Text(Graphics g, string s, Font f, Color c, RectangleF r, StringAlignment h)
+        {
+            using (var sf = new StringFormat(StringFormat.GenericTypographic))
+            using (var b = new SolidBrush(c))
+            {
+                sf.Alignment = h;
+                sf.LineAlignment = StringAlignment.Center;
+                sf.Trimming = StringTrimming.EllipsisCharacter;
+                sf.FormatFlags |= StringFormatFlags.NoWrap;
+                g.DrawString(s, f, b, r, sf);
+            }
+        }
+
+        private static Font UiFont(string family, float px)
+        {
+            string key = family + "|" + px.ToString(CultureInfo.InvariantCulture);
+            Font f;
+            if (!_fonts.TryGetValue(key, out f))
+            {
+                try { f = new Font(family, px, FontStyle.Regular, GraphicsUnit.Pixel); }
+                catch { f = new Font(FontFamily.GenericSansSerif, px, FontStyle.Regular, GraphicsUnit.Pixel); }
+                _fonts[key] = f;
+            }
+            return f;
+        }
+
+        // Windows 11: Segoe Fluent Icons, Windows 10: Segoe MDL2 Assets (ayni kod noktalari)
+        private static Font IconFont(float px)
+        {
+            string fam = "Segoe MDL2 Assets";
+            try { using (var ff = new FontFamily("Segoe Fluent Icons")) fam = ff.Name; } catch { }
+            return UiFont(fam, px);
+        }
+
+        private static GraphicsPath Round(RectangleF r, float rad)
+        {
+            var p = new GraphicsPath();
+            float d = Math.Max(0.1f, Math.Min(rad * 2, Math.Min(r.Width, r.Height)));
+            p.AddArc(r.X, r.Y, d, d, 180, 90);
+            p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+            p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+            p.CloseFigure();
+            return p;
+        }
+    }
+
     internal class CleanForm : Form
     {
+        private static readonly CultureInfo Tr = CultureInfo.GetCultureInfo("tr-TR");
+
         private readonly Settings _s;
-        private readonly Label _title = new Label();
-        private readonly Label _status = new Label();
-        private readonly Label _sizeLbl = new Label();
-        private readonly ProgressBar _bar = new ProgressBar();
-        private readonly System.Windows.Forms.Timer _closeTimer = new System.Windows.Forms.Timer();
-        private readonly System.Windows.Forms.Timer _fadeTimer = new System.Windows.Forms.Timer();
+        private readonly ToastState _st = new ToastState();
+        private readonly ToastTheme _th = ToastTheme.FromSystem();
+        private readonly System.Windows.Forms.Timer _anim = new System.Windows.Forms.Timer();
+        private Image _icon;
+        private float _sc = 1f;
+        private int _homeTop;
+        private DateTime _start, _closeStart, _closeAt = DateTime.MaxValue;
+        private bool _finished, _closing, _hover;
 
         private CleanEngine _engine;
         private List<Target> _targets;
@@ -527,173 +735,212 @@ namespace SPCleanerPlus
         public CleanForm(Settings s)
         {
             _s = s;
-            InitUi();
-        }
-
-        private void InitUi()
-        {
             FormBorderStyle = FormBorderStyle.None;
             StartPosition = FormStartPosition.Manual;
             ShowInTaskbar = false;
             TopMost = true;
-            Width = 380; Height = 150;
-            BackColor = Color.FromArgb(28, 30, 36);
-            Font = new Font("Segoe UI", 9f);
-            Opacity = 0.97;
-
-            var screen = Screen.PrimaryScreen.WorkingArea;
-            Left = screen.Right - Width - 16;
-            Top = screen.Bottom - Height - 16;
-
-            _title.Text = "SPCleaner+";
             Text = "SPCleaner+";
-            _title.ForeColor = Color.White;
-            _title.Font = new Font("Segoe UI Semibold", 12.5f, FontStyle.Bold);
-            _title.AutoSize = false;
-            _title.SetBounds(18, 14, Width - 36, 28);
+            BackColor = _th.Back;
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+            try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); _icon = Icon.ToBitmap(); } catch { }
+            using (var g = CreateGraphics()) _sc = g.DpiX / 96f;
 
-            _status.Text = "Hazirlaniyor...";
-            _status.ForeColor = Color.FromArgb(200, 205, 215);
-            _status.AutoSize = false;
-            _status.SetBounds(18, 48, Width - 36, 22);
+            Size = new Size((int)Math.Round(ToastPainter.W * _sc), (int)Math.Round(ToastPainter.H * _sc));
+            var wa = Screen.PrimaryScreen.WorkingArea;
+            int m = (int)Math.Round(12 * _sc);
+            Left = wa.Right - Width - m;
+            _homeTop = wa.Bottom - Height - m;
+            Top = _homeTop + (int)Math.Round(16 * _sc);
+            Opacity = 0;
 
-            _bar.SetBounds(18, 78, Width - 36, 16);
-            _bar.Style = ProgressBarStyle.Marquee;
-            _bar.MarqueeAnimationSpeed = 30;
-
-            _sizeLbl.Text = "";
-            _sizeLbl.ForeColor = Color.FromArgb(120, 200, 140);
-            _sizeLbl.Font = new Font("Segoe UI Semibold", 10f, FontStyle.Bold);
-            _sizeLbl.AutoSize = false;
-            _sizeLbl.TextAlign = ContentAlignment.MiddleRight;
-            _sizeLbl.SetBounds(18, 104, Width - 36, 26);
-
-            Controls.Add(_title);
-            Controls.Add(_status);
-            Controls.Add(_bar);
-            Controls.Add(_sizeLbl);
-
-            Load += async (a, b) => await RunAsync();
+            _st.Limited = !CleanEngine.IsAdmin();
+            _anim.Interval = 15;
+            _anim.Tick += (a, b) => OnAnim();
+            Load += async (a, b) => { _start = DateTime.Now; _anim.Start(); await RunAsync(); };
         }
 
-        protected override void OnShown(EventArgs e)
+        // odagi calmasin, Alt+Tab'da gorunmesin
+        protected override bool ShowWithoutActivation { get { return true; } }
+
+        protected override CreateParams CreateParams
         {
-            base.OnShown(e);
-            ApplyRoundRegion();
+            get
+            {
+                var cp = base.CreateParams;
+                cp.ExStyle |= 0x80 | 0x08000000; // WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+                return cp;
+            }
         }
 
-        private void ApplyRoundRegion()
+        protected override void OnHandleCreated(EventArgs e)
         {
+            base.OnHandleCreated(e);
             try
             {
-                int r = 16;
-                var gp = new GraphicsPath();
-                gp.AddArc(0, 0, r, r, 180, 90);
-                gp.AddArc(Width - r, 0, r, r, 270, 90);
-                gp.AddArc(Width - r, Height - r, r, r, 0, 90);
-                gp.AddArc(0, Height - r, r, r, 90, 90);
-                gp.CloseAllFigures();
-                Region = new Region(gp);
+                int round = 2;  // DWMWCP_ROUND: Windows 11'in kendi yuvarlak kosesi ve golgesi (Windows 10'da etkisiz)
+                DwmSetWindowAttribute(Handle, 33, ref round, 4);
+                int border = ColorTranslator.ToWin32(_th.Border);
+                DwmSetWindowAttribute(Handle, 34, ref border, 4);
             }
             catch { }
         }
 
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+
         protected override void OnPaint(PaintEventArgs e)
         {
-            base.OnPaint(e);
-            using (var pen = new Pen(Color.FromArgb(70, 75, 90)))
-                e.Graphics.DrawRectangle(pen, 0, 0, Width - 1, Height - 1);
+            ToastPainter.Paint(e.Graphics, _st, _th, _sc, _icon, _finished);
+        }
+
+        protected override void OnMouseEnter(EventArgs e) { base.OnMouseEnter(e); _hover = true; }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            _hover = true;
+            bool h = _finished && ToastPainter.CloseRect(_sc).Contains(e.Location);
+            if (h != _st.CloseHover) { _st.CloseHover = h; Cursor = h ? Cursors.Hand : Cursors.Default; Invalidate(); }
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            base.OnMouseLeave(e);
+            _hover = false;
+            if (_st.CloseHover) { _st.CloseHover = false; Cursor = Cursors.Default; Invalidate(); }
+            // fare ustundeyken kapanmaz; ayrilinca biraz daha bekler
+            if (_finished && _closeAt < DateTime.Now.AddSeconds(1.5)) _closeAt = DateTime.Now.AddSeconds(1.5);
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            base.OnMouseUp(e);
+            if (_finished && e.Button == MouseButtons.Left && ToastPainter.CloseRect(_sc).Contains(e.Location)) BeginClose();
+        }
+
+        private void OnAnim()
+        {
+            var now = DateTime.Now;
+            if (_closing)
+            {
+                double t = (now - _closeStart).TotalMilliseconds / 180.0;
+                if (t >= 1) { _anim.Stop(); Close(); }
+                else Opacity = 1 - t;
+                return;
+            }
+
+            // giris: 220 ms'de alttan kayarak belirir
+            double k = (now - _start).TotalMilliseconds / 220.0;
+            if (k < 1.05)
+            {
+                double ease = 1 - Math.Pow(1 - Math.Min(1, k), 3);
+                Opacity = ease;
+                Top = _homeTop + (int)Math.Round((1 - ease) * 16 * _sc);
+            }
+
+            bool repaint = false;
+            if (_st.Progress < 0)
+            {
+                _st.Marquee = (float)(((now - _start).TotalMilliseconds % 1500) / 1500.0);
+                repaint = true;
+            }
+            if (_st.Phase == ToastPhase.Scanning && _engine != null)
+            {
+                string d = Num(_engine.TotalFiles) + " dosya bulundu";
+                if (d != _st.Detail) { _st.Detail = d; repaint = true; }
+            }
+            if (repaint) Invalidate();
+
+            if (_finished && !_hover && now >= _closeAt) BeginClose();
         }
 
         private async Task RunAsync()
         {
             _engine = new CleanEngine(_s);
             _targets = _engine.BuildTargets();
-            if (!CleanEngine.IsAdmin()) _title.Text = "SPCleaner+ (sinirli mod)";
 
-            SetStatus(_s.Preview ? "Taraniyor (onizleme)..." : "Taraniyor...");
+            SetState(ToastPhase.Scanning, _s.Preview ? "Önizleme için taranıyor…" : "Taranıyor…", "Geçici dosyalar aranıyor", "", "", -1);
             await Task.Run(() => _engine.Scan(_targets, () => false));
-
-            _sizeLbl.Text = "Bulunan: " + Util.HumanSize(_engine.TotalBytes);
 
             if (_engine.TotalFiles == 0 && _engine.TotalBytes == 0)
             {
-                _bar.Style = ProgressBarStyle.Continuous;
-                _bar.Maximum = 1; _bar.Value = 1;
-                SetStatus("Zaten temiz, silinecek bir sey yok.");
-                _sizeLbl.ForeColor = Color.FromArgb(150, 160, 175);
-                _sizeLbl.Text = "0 B";
+                SetState(ToastPhase.AlreadyClean, "Her şey temiz", "Silinecek geçici dosya bulunamadı", "", "", 1);
+                _engine.WriteLog(_targets);
                 Finish();
                 return;
             }
 
             if (_s.Preview)
             {
-                _bar.Style = ProgressBarStyle.Continuous;
-                _bar.Maximum = 1; _bar.Value = 1;
-                SetStatus(_engine.TotalFiles + " dosya silinecek (onizleme)");
+                SetState(ToastPhase.Preview, "Önizleme hazır", Num(_engine.TotalFiles) + " dosya silinebilir · hiçbir şey silinmedi",
+                    Util.HumanSize(_engine.TotalBytes), "bulundu", 1);
                 _engine.WriteLog(_targets);
                 Finish();
                 return;
             }
 
             // gercek temizlik
-            _bar.Style = ProgressBarStyle.Continuous;
-            _bar.Minimum = 0;
-            _bar.Maximum = Math.Max(1, _engine.TotalFiles);
-            _bar.Value = 0;
-            SetStatus("Temizleniyor...");
-
+            int total = _engine.TotalFiles;
+            SetState(ToastPhase.Cleaning, "Temizleniyor…", "0 / " + Num(total) + " dosya", "0 B", "boşaldı", 0);
             var progress = new Progress<int>(v =>
             {
-                int val = Math.Min(_bar.Maximum, v);
-                _bar.Value = val;
-                _sizeLbl.Text = Util.HumanSize(_engine.BytesFreed) + " bosaldi";
+                if (_st.Phase != ToastPhase.Cleaning) return;
+                _st.Progress = total > 0 ? Math.Min(1.0, (double)v / total) : 1;
+                _st.Detail = Num(Math.Min(v, total)) + " / " + Num(total) + " dosya";
+                _st.BigValue = Util.HumanSize(_engine.BytesFreed);
+                Invalidate();
             });
-
             await Task.Run(() => _engine.Clean(progress, () => false));
-
-            _bar.Value = _bar.Maximum;
             _engine.WriteLog(_targets);
 
-            // sonuc metni
             var parts = new List<string>();
-            if (_engine.FilesDeleted > 0) parts.Add(_engine.FilesDeleted + (_engine.FilesDeleted == 1 ? " dosya" : " dosya"));
-            if (_engine.FoldersDeleted > 0) parts.Add(_engine.FoldersDeleted + " klasor");
-            string what = parts.Count > 0 ? string.Join(", ", parts) + " silindi" : "Silinecek bir sey yoktu";
-            if (_engine.ScheduledForReboot > 0) what += "  (+" + _engine.ScheduledForReboot + " yeniden baslatmada)";
-            SetStatus(what);
-            _sizeLbl.Text = Util.HumanSize(_engine.BytesFreed) + " bosaldi";
+            if (_engine.FilesDeleted > 0) parts.Add(Num(_engine.FilesDeleted) + " dosya");
+            if (_engine.FoldersDeleted > 0) parts.Add(Num(_engine.FoldersDeleted) + " klasör");
+            string detail = parts.Count > 0 ? string.Join(" · ", parts) + " silindi" : "Dosyalar kullanımda, silinemedi";
+            SetState(ToastPhase.Done, "Temizlik tamamlandı", detail, Util.HumanSize(_engine.BytesFreed), "boşaldı", 1);
 
+            var notes = new List<string>();
+            if (_engine.ScheduledForReboot > 0) notes.Add(Num(_engine.ScheduledForReboot) + " dosya yeniden başlatınca silinecek");
+            if (_engine.Errors > 0) notes.Add(Num(_engine.Errors) + " öğe silinemedi");
+            _st.Footnote = string.Join(" · ", notes);
             Finish();
+        }
+
+        private void SetState(ToastPhase phase, string headline, string detail, string big, string bigCaption, double progress)
+        {
+            _st.Phase = phase;
+            _st.Headline = headline;
+            _st.Detail = detail;
+            _st.BigValue = big;
+            _st.BigCaption = bigCaption;
+            _st.Progress = progress;
+            Invalidate();
         }
 
         private void Finish()
         {
-            if (_s.AutoCloseSeconds <= 0) { _closeTimer.Interval = 1500; }
-            else { _closeTimer.Interval = _s.AutoCloseSeconds * 1000; }
-            _closeTimer.Tick += (a, b) => { _closeTimer.Stop(); StartFade(); };
-            _closeTimer.Start();
+            _finished = true;
+            double sec = _s.AutoCloseSeconds <= 0 ? 1.5 : _s.AutoCloseSeconds;
+            _closeAt = DateTime.Now.AddSeconds(sec);
+            Invalidate();
         }
 
-        private void StartFade()
+        private void BeginClose()
         {
-            _fadeTimer.Interval = 30;
-            _fadeTimer.Tick += (a, b) =>
-            {
-                if (Opacity <= 0.08) { _fadeTimer.Stop(); Close(); }
-                else Opacity -= 0.07;
-            };
-            _fadeTimer.Start();
+            if (_closing) return;
+            _closing = true;
+            _closeStart = DateTime.Now;
+            if (!_anim.Enabled) _anim.Start();
         }
 
-        private void SetStatus(string t) { _status.Text = t; }
+        private static string Num(int n) { return n.ToString("N0", Tr); }
 
         public int ExitCode
         {
             get
             {
                 if (_engine == null) return 0;
+                if (_s.Preview) return _engine.TotalFiles > 0 ? 0 : 2;   // sessiz moddaki onizleme ile ayni
                 if (_engine.Errors > 0) return 1;
                 if (_engine.FilesDeleted == 0 && _engine.FoldersDeleted == 0 && _engine.ScheduledForReboot == 0) return 2;
                 return 0;

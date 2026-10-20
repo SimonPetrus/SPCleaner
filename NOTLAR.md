@@ -12,14 +12,14 @@ Son güncelleme: 2026-10-20
 ## 1) SPCleaner+ (asıl uygulamamız)
 
 ### Dosyalar
-- `SPCleaner+.exe` — çalışan uygulama, ürün adı "SPCleaner+", sürüm 2.0.0.0 (~64 KB, ikon gömülü, .NET Framework 4.8, x64)
+- `SPCleaner+.exe` — çalışan uygulama, ürün adı "SPCleaner+", sürüm 2.1.0.0 (~64 KB, ikon gömülü, .NET Framework 4.8, x64)
 - `SPCleaner+.cs` — tüm kaynak kod (tek dosya)
 - **Tek exe:** ayar dosyası (ini) yok, ayarlar exe içinde sabit; sadece komut satırı parametreleri değiştirir.
 - `app.manifest` — `asInvoker` → ikonda UAC kalkanı yok. Program açılışta kendini `runas` ile yeniden
   başlatır, standart UAC onayı yine çıkar (UAC atlatma DEĞİL). "Hayır" denirse **sınırlı mod**: sadece
   kullanıcının kendi Temp + hata raporu/CrashDumps klasörleri; başlıkta "(sinirli mod)" yazar.
   UAC kapalıysa / "Asla bildirme" ayarındaysa soru çıkmadan tam yetkiyle çalışır (Windows'un kendi davranışı).
-- `build.bat` — yeniden derleme betiği (ikonu `/win32icon` ile gömer)
+- `build.bat` — yeniden derleme betiği (ikonu `/win32icon` ile gömer; `/codepage:65001` → kaynakta Türkçe karakter)
 - `SPCleaner+.ico` — uygulama ikonu (Windows 11 tarzı: büyük mavi **SP** diskin üstünde, önde süpürge, yanında ışıltılar; 16–256 px)
 - `ikon/IkonOlustur.cs` + `ikon/ikon_olustur.bat` — ikonu kodla çizen üreteç. Değiştirmek için `.cs`'i düzenle,
   `ikon_olustur.bat` → `build.bat`. 16–24 px boyutlarda sadece SP harfleri çizilir (detay okunmaz).
@@ -37,7 +37,11 @@ Son güncelleme: 2026-10-20
   `ProgramData\Microsoft\Windows\WER\ReportQueue|ReportArchive|Temp`, `C:\Windows\Minidump`,
   `C:\Windows\MEMORY.DMP`, her kullanıcının `AppData\Local\Microsoft\Windows\WER\...` ve `AppData\Local\CrashDumps`.
 - **Silinen dosya + klasör sayısı** ve **boşalan alan (MB/GB)** gösterir.
-- **İlerleme çubuğu** (gerçek yüzde) + iş bitince **birkaç saniye sonra soluklaşıp kapanır**.
+- **Bildirim penceresi (v2.1, Windows 11 tarzı):** sağ altta alttan kayarak açılır, odağı çalmaz; açık/koyu tema ve
+  Windows vurgu rengine uyar; Win11 yerel yuvarlak köşe+gölge (DWM); durum simgesi (Segoe Fluent Icons), ince ilerleme
+  çubuğu, canlı dosya sayacı, büyük "boşaldı" değeri, "Sınırlı mod" rozeti; bitince ✕ düğmesi, fare üstündeyken kapanmaz.
+  Çizim `ToastPainter` sınıfında, durum `ToastState`'te (önizleme resimleri aynı kodla çizilebilir).
+- İş bitince **birkaç saniye sonra soluklaşıp kapanır**.
 - Kritik klasörlere asla dokunmaz: `C:\`, Windows, System32, Program Files, kullanıcı profili.
 - Junction/symlink'lerin içine girmez (yanlış klasör silmeyi önler).
 - Silinemeyen (kilitli) dosyaların salt-okunur/gizli/sistem niteliğini kaldırıp tekrar dener;
@@ -92,7 +96,7 @@ SHA-256: `68bc0630e20c481856e2e5e6703913278a912f2d288dbca8ba14bbb1eec6b529`
 
 ## GitHub
 - Repo (private): https://github.com/SimonPetrus/SPCleaner — dal `main`.
-- Exe repoda değil, **Releases**'ta: v2.0.0 → `SPCleaner+.exe`. Yeni sürüm: `build.bat` → `gh release create vX.Y.Z "SPCleaner+.exe"`.
+- Exe repoda değil, **Releases**'ta: v2.0.0, v2.1.0 (yeni bildirim penceresi) → `SPCleaner+.exe`. Yeni sürüm: `build.bat` → `gh release create vX.Y.Z "SPCleaner+.exe"`.
 - Dışarıda (`.gitignore`): `_Sohbet_Kaydi/`, `*.exe`, `*.log`. Repo public yapılırsa `RE_Analiz_EskiTempCleaner/` kaldırılmalı.
 
 ## Sohbet kaydı / devam etme
