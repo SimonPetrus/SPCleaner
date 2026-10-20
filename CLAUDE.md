@@ -11,7 +11,8 @@ Bu klasör iki işi içerir; ayrıntılar `NOTLAR.md` dosyasında. Kısa özet:
   **Asla UAC atlatma yapma/önerme.**
 - Davranış: açılışta otomatik temizler; ilerleme çubuğu; silinen dosya/klasör sayısı +
   boşalan alanı MB/GB gösterir; birkaç saniye sonra kendini kapatır.
-- Hedefler: `C:\Windows\Temp`, `%TEMP%`, kayıt defteri `TEMP`/`TMP`, (admin) tüm kullanıcı Temp'leri.
+- Hedefler: `C:\Windows\Temp`, `%TEMP%`, kayıt defteri `TEMP`/`TMP`, (admin) tüm kullanıcı Temp'leri,
+  7 günden eski WER/çökme dökümleri, (admin) Windows Update Download (sıkı koşullarla) ve Teslim İyileştirme önbelleği.
 - **Temizlenmez (kullanıcı kararı):** Geri Dönüşüm Kutusu, tarayıcı önbellekleri.
 - Koruma: `C:\`, Windows, System32, Program Files, kullanıcı profili asla silinmez;
   junction/symlink içine girilmez.

@@ -1,4 +1,5 @@
-// SPCleaner+ - Gecici (Temp) klasorlerini, eski hata raporlarini ve cokme dokumlerini temizleyen tek-exe arac.
+// SPCleaner+ - Gecici (Temp) klasorlerini, eski hata raporlarini, cokme dokumlerini, Windows Update ve
+// Teslim Iyilestirme onbelleklerini temizleyen tek-exe arac.
 // Derleme: build.bat (bkz. ayni klasor)
 // Kullanim (ayar dosyasi yok, ayarlar exe icinde sabit):
 //   Cift tik      : Pencereli, otomatik temizler, bitince kapanir (UAC onayi ister)
@@ -8,6 +9,9 @@
 //   /EXCLUDE:a;b  : Haric tutulacak desenler (* ve ? kullanilabilir)
 //   Yonetici izni : Acilista UAC onayi istenir (kendini "runas" ile yeniden baslatir). Reddedilirse
 //                   sadece kullanicinin kendi Temp/hata raporu klasorleri temizlenir ("sinirli mod").
+//   Windows Update: Download klasoru; sadece wuauserv/BITS/TrustedInstaller durmusken ve yeniden baslatma
+//                   beklenmiyorken, 7 gunden eski dosyalar; kontrol silmeden hemen once tekrarlanir.
+//   Teslim Iyil.  : Windows'un Delete-DeliveryOptimizationCache komutuyla; aktif indirme varsa atlanir.
 //   Cikis kodlari : 0=basarili  1=hata oldu  2=silinecek sey yoktu  -1=zaten calisiyor
 using System;
 using System.Collections.Generic;
@@ -32,8 +36,8 @@ using Microsoft.Win32;
 [assembly: AssemblyTitle("SPCleaner+")]
 [assembly: AssemblyDescription("SPCleaner+ - Gecici dosya temizleyici")]
 [assembly: AssemblyProduct("SPCleaner+")]
-[assembly: AssemblyVersion("2.1.0.0")]
-[assembly: AssemblyFileVersion("2.1.0.0")]
+[assembly: AssemblyVersion("2.2.0.0")]
+[assembly: AssemblyFileVersion("2.2.0.0")]
 
 namespace SPCleanerPlus
 {
@@ -79,12 +83,25 @@ namespace SPCleanerPlus
         }
     }
 
+    // ---------------------- Kaynak (Ayrintilar listesindeki bir satir) ----------------------
+    internal class SourceStat
+    {
+        public string Label;
+        public long Found;        // taramada bulunan boyut
+        public long Freed;        // silinen boyut
+        public string Skip;       // atlandiysa nedeni (or. "yönetici izni gerekli")
+    }
+
     // ---------------------- Hedef ----------------------
     internal class Target
     {
         public string Path;
         public bool IsFile;        // klasor yerine tek dosya (or. MEMORY.DMP)
         public int MinAgeHours;    // bundan yeni dosyalara dokunma (0 = hepsi)
+        public SourceStat Source;  // hangi kaynaga sayilir
+        public bool NoReboot;      // kullanimdaki dosya yeniden baslatmaya birakilmaz, sessizce atlanir
+        public Func<string> Guard; // silmeden hemen once tekrar sorulur; null degilse hedef atlanir (neden)
+        public bool Skipped;
 
         public override string ToString()
         {
@@ -100,11 +117,21 @@ namespace SPCleanerPlus
         private readonly HashSet<string> _protected;
         private readonly bool _admin;
 
+        // kaynaklar (Ayrintilar'daki sirayla)
+        private readonly SourceStat _srcWinTemp = new SourceStat { Label = "Windows Temp" };
+        private readonly SourceStat _srcUserTemp = new SourceStat { Label = "Kullanıcı Temp" };
+        private readonly SourceStat _srcDelivery = new SourceStat { Label = "Teslim İyileştirme önbelleği" };
+        private readonly SourceStat _srcUpdate = new SourceStat { Label = "Windows Update önbelleği (7 günden eski)" };
+        private readonly SourceStat _srcWer = new SourceStat { Label = "Hata raporları (7 günden eski)" };
+        private readonly SourceStat _srcDumps = new SourceStat { Label = "Çökme dökümleri (7 günden eski)" };
+        public List<SourceStat> Sources { get { return new List<SourceStat> { _srcWinTemp, _srcUserTemp, _srcDelivery, _srcUpdate, _srcWer, _srcDumps }; } }
+
         // bulunan ogeler
         private readonly List<string> _files = new List<string>();
         private readonly List<long> _fileSizes = new List<long>();
-        private readonly List<string> _dirs = new List<string>();         // normal alt klasorler (en derin once silinir)
-        private readonly List<string> _reparse = new List<string>();      // junction/symlink -> sadece baglanti silinir, icine girilmez
+        private readonly List<Target> _fileTargets = new List<Target>();
+        private readonly List<KeyValuePair<string, Target>> _dirs = new List<KeyValuePair<string, Target>>();    // normal alt klasorler (en derin once silinir)
+        private readonly List<KeyValuePair<string, Target>> _reparse = new List<KeyValuePair<string, Target>>(); // junction/symlink -> sadece baglanti silinir, icine girilmez
 
         public long TotalBytes { get; private set; }
         public int TotalFiles { get { return _files.Count; } }
@@ -138,7 +165,7 @@ namespace SPCleanerPlus
             var set = new Dictionary<string, Target>(StringComparer.OrdinalIgnoreCase); // norm -> hedef
             int crashAge = Settings.CrashDataAgeHours;
 
-            Action<string, int> addDir = (p, age) =>
+            Action<string, int, SourceStat> addDir = (p, age, src) =>
             {
                 if (string.IsNullOrWhiteSpace(p)) return;
                 try
@@ -148,20 +175,20 @@ namespace SPCleanerPlus
                     try { full = new DirectoryInfo(full).FullName; } catch { }
                     string norm = Norm(full);
                     if (IsProtected(full)) return;      // guvenlik: kritik klasor hedef olamaz
-                    if (!set.ContainsKey(norm)) set[norm] = new Target { Path = full, MinAgeHours = age };
+                    if (!set.ContainsKey(norm)) set[norm] = new Target { Path = full, MinAgeHours = age, Source = src };
                 }
                 catch { }
             };
-            Action<string> add = p => addDir(p, 0);
+            Action<string> addTemp = p => addDir(p, 0, _srcUserTemp);
 
-            Action<string, int> addFile = (p, age) =>
+            Action<string, int, SourceStat> addFile = (p, age, src) =>
             {
                 try
                 {
                     string full = Path.GetFullPath(p);
                     if (!File.Exists(full)) return;
                     string norm = Norm(full);
-                    if (!set.ContainsKey(norm)) set[norm] = new Target { Path = full, IsFile = true, MinAgeHours = age };
+                    if (!set.ContainsKey(norm)) set[norm] = new Target { Path = full, IsFile = true, MinAgeHours = age, Source = src };
                 }
                 catch { }
             };
@@ -170,16 +197,18 @@ namespace SPCleanerPlus
             Action<string> addUserCrashData = localAppData =>
             {
                 if (string.IsNullOrEmpty(localAppData)) return;
-                addDir(Path.Combine(localAppData, @"Microsoft\Windows\WER\ReportQueue"), crashAge);
-                addDir(Path.Combine(localAppData, @"Microsoft\Windows\WER\ReportArchive"), crashAge);
-                addDir(Path.Combine(localAppData, "CrashDumps"), crashAge);
+                addDir(Path.Combine(localAppData, @"Microsoft\Windows\WER\ReportQueue"), crashAge, _srcWer);
+                addDir(Path.Combine(localAppData, @"Microsoft\Windows\WER\ReportArchive"), crashAge, _srcWer);
+                addDir(Path.Combine(localAppData, "CrashDumps"), crashAge, _srcDumps);
             };
 
+            const string NeedAdmin = "yönetici izni gerekli";
             string winDir = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
-            if (_admin) add(Path.Combine(winDir, "Temp"));   // sinirli modda zaten silinemez
-            add(Path.GetTempPath());
-            add(Environment.GetEnvironmentVariable("TEMP"));
-            add(Environment.GetEnvironmentVariable("TMP"));
+            if (_admin) addDir(Path.Combine(winDir, "Temp"), 0, _srcWinTemp);   // sinirli modda zaten silinemez
+            else _srcWinTemp.Skip = NeedAdmin;
+            addTemp(Path.GetTempPath());
+            addTemp(Environment.GetEnvironmentVariable("TEMP"));
+            addTemp(Environment.GetEnvironmentVariable("TMP"));
 
             // sistem geneli hata raporlari (WER) ve cokme dokumleri (yonetici gerekir)
             string programData = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
@@ -187,14 +216,33 @@ namespace SPCleanerPlus
             {
                 if (!string.IsNullOrEmpty(programData))
                 {
-                    addDir(Path.Combine(programData, @"Microsoft\Windows\WER\ReportQueue"), crashAge);
-                    addDir(Path.Combine(programData, @"Microsoft\Windows\WER\ReportArchive"), crashAge);
-                    addDir(Path.Combine(programData, @"Microsoft\Windows\WER\Temp"), crashAge);
+                    addDir(Path.Combine(programData, @"Microsoft\Windows\WER\ReportQueue"), crashAge, _srcWer);
+                    addDir(Path.Combine(programData, @"Microsoft\Windows\WER\ReportArchive"), crashAge, _srcWer);
+                    addDir(Path.Combine(programData, @"Microsoft\Windows\WER\Temp"), crashAge, _srcWer);
                 }
-                addDir(Path.Combine(winDir, "Minidump"), crashAge);
-                addFile(Path.Combine(winDir, "MEMORY.DMP"), crashAge);
+                addDir(Path.Combine(winDir, "Minidump"), crashAge, _srcDumps);
+                addFile(Path.Combine(winDir, "MEMORY.DMP"), crashAge, _srcDumps);
             }
             addUserCrashData(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData));
+
+            // Windows Update indirme onbellegi: sadece guncelleme hicbir sey yapmiyorken, 7 gunden eski dosyalar,
+            // kullanimdaki dosya zorlanmaz; servisler biz tarafindan durdurulmaz
+            if (!_admin) _srcUpdate.Skip = NeedAdmin;
+            else
+            {
+                string busy = WindowsUpdateBusy();
+                if (busy != null) _srcUpdate.Skip = busy;
+                else
+                {
+                    addDir(Path.Combine(winDir, @"SoftwareDistribution\Download"), crashAge, _srcUpdate);
+                    Target wu;
+                    if (set.TryGetValue(Norm(Path.Combine(winDir, @"SoftwareDistribution\Download")), out wu))
+                    {
+                        wu.NoReboot = true;
+                        wu.Guard = WindowsUpdateBusy;
+                    }
+                }
+            }
 
             // kullanicinin kayit defterindeki TEMP/TMP
             try
@@ -203,8 +251,8 @@ namespace SPCleanerPlus
                 {
                     if (rk != null)
                     {
-                        add(ExpandEnv(rk.GetValue("TEMP") as string));
-                        add(ExpandEnv(rk.GetValue("TMP") as string));
+                        addTemp(ExpandEnv(rk.GetValue("TEMP") as string));
+                        addTemp(ExpandEnv(rk.GetValue("TMP") as string));
                     }
                 }
             }
@@ -224,7 +272,7 @@ namespace SPCleanerPlus
                             if (leaf.Equals("Public", StringComparison.OrdinalIgnoreCase)) continue;
                             if (leaf.StartsWith("Default", StringComparison.OrdinalIgnoreCase)) continue; // Default, Default User
                             if (leaf.StartsWith("All Users", StringComparison.OrdinalIgnoreCase)) continue;
-                            add(Path.Combine(dir, @"AppData\Local\Temp"));
+                            addTemp(Path.Combine(dir, @"AppData\Local\Temp"));
                             addUserCrashData(Path.Combine(dir, @"AppData\Local"));
                         }
                     }
@@ -242,14 +290,15 @@ namespace SPCleanerPlus
             {
                 if (cancel != null && cancel()) return;
                 int age = Math.Max(_s.AgeHours, t.MinAgeHours);
-                if (t.IsFile) AddFile(t.Path, age);
-                else Walk(t.Path, age, cancel);
+                if (t.IsFile) AddFile(t.Path, age, t);
+                else Walk(t.Path, age, t, cancel);
             }
             // en derin klasorler once silinsin
-            _dirs.Sort((a, b) => b.Length.CompareTo(a.Length));
+            _dirs.Sort((a, b) => b.Key.Length.CompareTo(a.Key.Length));
+            ScanDeliveryOptimization();
         }
 
-        private void AddFile(string f, int ageHours)
+        private void AddFile(string f, int ageHours, Target t)
         {
             if (IsExcluded(f)) return;
             FileInfo fi;
@@ -263,14 +312,16 @@ namespace SPCleanerPlus
             try { len = fi.Length; } catch { }
             _files.Add(f);
             _fileSizes.Add(len);
+            _fileTargets.Add(t);
             TotalBytes += len;
+            t.Source.Found += len;
         }
 
-        private void Walk(string dir, int ageHours, Func<bool> cancel)
+        private void Walk(string dir, int ageHours, Target t, Func<bool> cancel)
         {
             if (cancel != null && cancel()) return;
 
-            foreach (var f in SafeGetFiles(dir)) AddFile(f, ageHours);
+            foreach (var f in SafeGetFiles(dir)) AddFile(f, ageHours, t);
 
             foreach (var d in SafeGetDirs(dir))
             {
@@ -282,11 +333,11 @@ namespace SPCleanerPlus
                 if (reparse)
                 {
                     // junction/symlink: hedefine girme, sadece baglantiyi kaldiracagiz
-                    _reparse.Add(d);
+                    _reparse.Add(new KeyValuePair<string, Target>(d, t));
                     continue;
                 }
-                _dirs.Add(d);
-                Walk(d, ageHours, cancel);
+                _dirs.Add(new KeyValuePair<string, Target>(d, t));
+                Walk(d, ageHours, t, cancel);
             }
         }
 
@@ -299,20 +350,24 @@ namespace SPCleanerPlus
                 if (cancel != null && cancel()) break;
                 string f = _files[i];
                 long size = _fileSizes[i];
+                Target t = _fileTargets[i];
+                done++;
+                if (progress != null && (done % 16 == 0 || done == _files.Count)) progress.Report(done);
+                if (!Allowed(t)) continue;
                 try
                 {
                     ClearAttributes(f);
                     File.Delete(f);
                     FilesDeleted++;
                     BytesFreed += size;
+                    t.Source.Freed += size;
                 }
                 catch (Exception ex)
                 {
-                    if (_s.ScheduleReboot && _admin && TryScheduleDelete(f)) ScheduledForReboot++;
+                    if (t.NoReboot) LogErr(f, ex);   // kullanimda: zorlanmaz, hata sayilmaz
+                    else if (_s.ScheduleReboot && _admin && TryScheduleDelete(f)) ScheduledForReboot++;
                     else { Errors++; LogErr(f, ex); }
                 }
-                done++;
-                if (progress != null && (done % 16 == 0 || done == _files.Count)) progress.Report(done);
             }
             if (progress != null) progress.Report(_files.Count);
 
@@ -320,14 +375,30 @@ namespace SPCleanerPlus
             foreach (var link in _reparse)
             {
                 if (cancel != null && cancel()) break;
-                if (TryDeleteLink(link)) FoldersDeleted++;
+                if (!Allowed(link.Value)) continue;
+                if (TryDeleteLink(link.Key)) FoldersDeleted++;
             }
             // bos kalan klasorleri sil (en derin once)
             foreach (var d in _dirs)
             {
                 if (cancel != null && cancel()) break;
-                if (TryDeleteDir(d)) FoldersDeleted++;
+                if (!Allowed(d.Value)) continue;
+                if (TryDeleteDir(d.Key)) FoldersDeleted++;
             }
+
+            CleanDeliveryOptimization();
+        }
+
+        // hedefin korumasi silmeden hemen once bir kez daha sorulur (or. bu arada Windows Update basladiysa)
+        private readonly HashSet<Target> _guarded = new HashSet<Target>();
+        private bool Allowed(Target t)
+        {
+            if (t.Guard != null && _guarded.Add(t))
+            {
+                string reason = t.Guard();
+                if (reason != null) { t.Skipped = true; t.Source.Skip = reason; }
+            }
+            return !t.Skipped;
         }
 
         private bool TryDeleteLink(string link)
@@ -360,6 +431,101 @@ namespace SPCleanerPlus
                 Errors++; LogErr(d, ex);
                 return false;
             }
+        }
+
+        // ---- Windows Update: herhangi bir is yapiyor mu? ----
+        // Servislerden biri calisiyorsa veya kurulum/yeniden baslatma bekleniyorsa onbellege dokunulmaz.
+        // Durum okunamazsa da dokunulmaz (en temkinli secenek).
+        private static string WindowsUpdateBusy()
+        {
+            foreach (var name in new[] { "wuauserv", "BITS", "TrustedInstaller" })
+            {
+                try
+                {
+                    using (var sc = new System.ServiceProcess.ServiceController(name))
+                        if (sc.Status != System.ServiceProcess.ServiceControllerStatus.Stopped) return "güncelleme çalışıyor";
+                }
+                catch (InvalidOperationException) { }   // servis bu sistemde yok
+                catch { return "güncelleme durumu okunamadı"; }
+            }
+            try
+            {
+                foreach (var key in new[] { @"SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired",
+                                            @"SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending" })
+                    using (var rk = Registry.LocalMachine.OpenSubKey(key))
+                        if (rk != null) return "güncelleme yeniden başlatma bekliyor";
+            }
+            catch { return "güncelleme durumu okunamadı"; }
+            return null;
+        }
+
+        // ---- Teslim Iyilestirme onbellegi: Windows'un kendi komutuyla (klasore elle dokunulmaz) ----
+        private bool _doReady;
+
+        private void ScanDeliveryOptimization()
+        {
+            if (!_admin) { _srcDelivery.Skip = "yönetici izni gerekli"; return; }
+            // aktif indirme varsa (durumu "Caching" disinda bir is) dokunulmaz; cikti: <mesgul is sayisi>|<onbellek bayt>
+            string o = RunPowerShell(
+                "if (-not (Get-Command Delete-DeliveryOptimizationCache -ErrorAction SilentlyContinue)) { 'YOK'; exit }" +
+                "$b = @(Get-DeliveryOptimizationStatus | Where-Object { $_.Status -ne 'Caching' }).Count;" +
+                "$c = (Get-DeliveryOptimizationPerfSnap).CacheSizeBytes; \"$b|$c\"");
+            if (o == null) { _srcDelivery.Skip = "durum okunamadı"; return; }
+            if (o == "YOK") { _srcDelivery.Skip = "bu Windows'ta desteklenmiyor"; return; }
+            string[] p = o.Split('|');
+            int busy; long size;
+            if (p.Length != 2 || !int.TryParse(p[0], out busy) || !long.TryParse(p[1], out size)) { _srcDelivery.Skip = "durum okunamadı"; return; }
+            if (busy > 0) { _srcDelivery.Skip = "indirme sürüyor"; return; }
+            _srcDelivery.Found = size;
+            TotalBytes += size;
+            _doReady = size > 0;
+        }
+
+        private void CleanDeliveryOptimization()
+        {
+            if (!_doReady) return;
+            // silmeden hemen once tekrar: bu arada indirme basladiysa vazgec
+            string o = RunPowerShell(
+                "if (@(Get-DeliveryOptimizationStatus | Where-Object { $_.Status -ne 'Caching' }).Count -gt 0) { 'MESGUL'; exit }" +
+                "$a = (Get-DeliveryOptimizationPerfSnap).CacheSizeBytes; Delete-DeliveryOptimizationCache -Force;" +
+                "$b = (Get-DeliveryOptimizationPerfSnap).CacheSizeBytes; \"$a|$b\"");
+            if (o == "MESGUL") { _srcDelivery.Skip = "indirme sürüyor"; return; }
+            long before, after;
+            string[] p = o == null ? new string[0] : o.Split('|');
+            if (p.Length == 2 && long.TryParse(p[0], out before) && long.TryParse(p[1], out after))
+            {
+                long freed = Math.Max(0, before - after);
+                _srcDelivery.Freed = freed;
+                BytesFreed += freed;
+                DeliveryFreed = freed;
+            }
+            else { Errors++; _logLines.Add("HATA  Teslim Iyilestirme onbellegi temizlenemedi :: " + (o ?? "yanit yok")); }
+        }
+
+        public long DeliveryFreed { get; private set; }
+
+        private static string RunPowerShell(string script)
+        {
+            try
+            {
+                string exe = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), @"WindowsPowerShell\v1.0\powershell.exe");
+                var psi = new ProcessStartInfo(exe, "-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command -")
+                {
+                    UseShellExecute = false, CreateNoWindow = true,
+                    RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true
+                };
+                using (var p = Process.Start(psi))
+                {
+                    p.StandardInput.WriteLine(script);
+                    p.StandardInput.Close();
+                    var outTask = p.StandardOutput.ReadToEndAsync();
+                    p.StandardError.ReadToEndAsync();
+                    if (!p.WaitForExit(60000)) { try { p.Kill(); } catch { } return null; }
+                    string o = outTask.Result.Trim();
+                    return o.Length == 0 ? null : o.Split('\n').Last().Trim();
+                }
+            }
+            catch { return null; }
         }
 
         // ---- yardimcilar ----
@@ -477,6 +643,10 @@ namespace SPCleanerPlus
                 sb.AppendLine("Bosalan alan: " + Util.HumanSize(BytesFreed));
                 sb.AppendLine("Yeniden baslatmada silinecek: " + ScheduledForReboot);
                 sb.AppendLine("Hata: " + Errors);
+                sb.AppendLine("Kaynaklar:");
+                foreach (var src in Sources)
+                    sb.AppendLine("  " + src.Label + ": " + (src.Skip != null ? "atlandi (" + src.Skip + ")"
+                        : "bulunan " + Util.HumanSize(src.Found) + ", silinen " + Util.HumanSize(src.Freed)));
                 if (_logLines.Count > 0) { sb.AppendLine("---- detay ----"); foreach (var l in _logLines) sb.AppendLine(l); }
                 File.AppendAllText(Path.Combine(Settings.AppDir(), "SPCleaner+.log"), sb.ToString() + Environment.NewLine, Encoding.UTF8);
             }
@@ -527,6 +697,16 @@ namespace SPCleanerPlus
         public float Marquee;             // belirsiz cubugun konumu 0..1
         public bool Limited;              // "Sınırlı mod" rozeti
         public bool CloseHover;
+        public List<ToastRow> Rows = new List<ToastRow>();   // "Ayrıntılar": kaynak basina sonuc
+        public bool Expanded;             // ayrintilar acik mi
+        public bool DetailsHover;
+    }
+
+    internal class ToastRow
+    {
+        public string Label, Value;
+        public string Note = "";          // atlandiysa nedeni: satirin altinda kucuk ikinci satir
+        public bool Dim;                  // bos / atlanan satir soluk gosterilir
     }
 
     internal class ToastTheme
@@ -595,6 +775,20 @@ namespace SPCleanerPlus
         private static readonly Dictionary<string, Font> _fonts = new Dictionary<string, Font>();
 
         public static RectangleF CloseRect(float sc) { return new RectangleF((W - 40) * sc, 6 * sc, 32 * sc, 28 * sc); }
+        public static RectangleF DetailsRect(float sc) { return new RectangleF((W - 40 - 4 - 104) * sc, 6 * sc, 104 * sc, 28 * sc); }   // ust satir, kapat dugmesinin solu
+
+        private const int RowH = 24, NoteH = 15;
+
+        private static int RowHeight(ToastRow r) { return RowH + (r.Note.Length > 0 ? NoteH : 0); }
+
+        // ayrintilar acikken pencere asagiya dogru uzar (pencere de o kadar yukari kayar)
+        public static int HeightFor(ToastState st)
+        {
+            if (!st.Expanded || st.Rows.Count == 0) return H;
+            int h = H + 10 + 6;
+            foreach (var r in st.Rows) h += RowHeight(r);
+            return h;
+        }
 
         public static void Paint(Graphics g, ToastState st, ToastTheme th, float sc, Image appIcon, bool showClose)
         {
@@ -650,8 +844,18 @@ namespace SPCleanerPlus
             // orta: baslik + ayrinti + not
             Text(g, st.Headline, UiFont("Segoe UI Semibold", S(15)), th.Text, new RectangleF(S(60), S(39), S(W - 76) - bigW - S(10), S(24)), StringAlignment.Near);
             Text(g, st.Detail, UiFont("Segoe UI", S(12)), th.SubText, new RectangleF(S(60), S(63), S(W - 76) - capW2 - S(10), S(20)), StringAlignment.Near);
+            bool link = showClose && st.Rows.Count > 0;
             if (st.Footnote.Length > 0)
                 Text(g, st.Footnote, UiFont("Segoe UI", S(11.5f)), th.SubText, new RectangleF(S(60), S(81), S(W - 76), S(18)), StringAlignment.Near);
+            if (link)
+            {
+                var lr = DetailsRect(sc);
+                if (st.DetailsHover) using (var path = Round(lr, S(4))) using (var b = new SolidBrush(th.HoverBack)) g.FillPath(b, path);
+                var chevron = new RectangleF(lr.Right - S(24), lr.Y, S(16), lr.Height);
+                Text(g, st.Expanded ? "\uE70E" : "\uE70D", IconFont(S(9)), th.Accent, chevron, StringAlignment.Center);
+                Text(g, st.Expanded ? "Gizle" : "Ayrıntılar", UiFont("Segoe UI Semibold", S(12)), th.Accent,
+                    new RectangleF(lr.X, lr.Y, lr.Width - S(26), lr.Height), StringAlignment.Far);
+            }
 
             // alt: ince ilerleme cubugu
             var track = new RectangleF(S(16), S(104), S(W - 32), S(4));
@@ -666,6 +870,27 @@ namespace SPCleanerPlus
             else fill = new RectangleF(track.X, track.Y, track.Width * (float)Math.Max(0, Math.Min(1, st.Progress)), track.Height);
             if (fill.Width > 0.5f)
                 using (var path = Round(fill, Math.Min(S(2), fill.Width / 2))) using (var b = new SolidBrush(stateColor)) g.FillPath(b, path);
+
+            // ayrintilar: kaynak basina satir (etiket solda, deger sagda)
+            if (st.Expanded && st.Rows.Count > 0)
+            {
+                float y0 = S(H - 2);
+                using (var pen = new Pen(th.Border, Math.Max(1f, S(1)))) g.DrawLine(pen, S(16), y0, S(W - 16), y0);
+                Font lf = UiFont("Segoe UI", S(12)), vf = UiFont("Segoe UI Semibold", S(12)), nf = UiFont("Segoe UI", S(11));
+                float y = y0 + S(8);
+                foreach (var row in st.Rows)
+                {
+                    var rr = new RectangleF(S(16), y, S(W - 32), S(RowH));
+                    Font valFont = row.Dim ? lf : vf;
+                    // deger sagda; etiket ancak degere kadar uzanir (gerekirse "…" ile kisalir), ust uste binmez
+                    float vw = g.MeasureString(row.Value, valFont, PointF.Empty, StringFormat.GenericTypographic).Width;
+                    Text(g, row.Value, valFont, row.Dim ? th.SubText : th.Text, rr, StringAlignment.Far);
+                    Text(g, row.Label, lf, row.Dim ? th.SubText : th.Text, new RectangleF(rr.X, rr.Y, Math.Max(0, rr.Width - vw - S(12)), rr.Height), StringAlignment.Near);
+                    if (row.Note.Length > 0)
+                        Text(g, row.Note, nf, th.SubText, new RectangleF(rr.X, rr.Bottom - S(5), rr.Width, S(NoteH)), StringAlignment.Near);
+                    y += S(RowHeight(row));
+                }
+            }
         }
 
         private static void Text(Graphics g, string s, Font f, Color c, RectangleF r, StringAlignment h)
@@ -725,7 +950,7 @@ namespace SPCleanerPlus
         private readonly System.Windows.Forms.Timer _anim = new System.Windows.Forms.Timer();
         private Image _icon;
         private float _sc = 1f;
-        private int _homeTop;
+        private int _homeTop, _bottom;
         private DateTime _start, _closeStart, _closeAt = DateTime.MaxValue;
         private bool _finished, _closing, _hover;
 
@@ -749,7 +974,8 @@ namespace SPCleanerPlus
             var wa = Screen.PrimaryScreen.WorkingArea;
             int m = (int)Math.Round(12 * _sc);
             Left = wa.Right - Width - m;
-            _homeTop = wa.Bottom - Height - m;
+            _bottom = wa.Bottom - m;
+            _homeTop = _bottom - Height;
             Top = _homeTop + (int)Math.Round(16 * _sc);
             Opacity = 0;
 
@@ -800,22 +1026,48 @@ namespace SPCleanerPlus
             base.OnMouseMove(e);
             _hover = true;
             bool h = _finished && ToastPainter.CloseRect(_sc).Contains(e.Location);
-            if (h != _st.CloseHover) { _st.CloseHover = h; Cursor = h ? Cursors.Hand : Cursors.Default; Invalidate(); }
+            bool dh = _finished && _st.Rows.Count > 0 && ToastPainter.DetailsRect(_sc).Contains(e.Location);
+            if (h != _st.CloseHover || dh != _st.DetailsHover)
+            {
+                _st.CloseHover = h; _st.DetailsHover = dh;
+                Cursor = h || dh ? Cursors.Hand : Cursors.Default;
+                Invalidate();
+            }
         }
 
         protected override void OnMouseLeave(EventArgs e)
         {
             base.OnMouseLeave(e);
             _hover = false;
-            if (_st.CloseHover) { _st.CloseHover = false; Cursor = Cursors.Default; Invalidate(); }
-            // fare ustundeyken kapanmaz; ayrilinca biraz daha bekler
-            if (_finished && _closeAt < DateTime.Now.AddSeconds(1.5)) _closeAt = DateTime.Now.AddSeconds(1.5);
+            if (_st.CloseHover || _st.DetailsHover) { _st.CloseHover = _st.DetailsHover = false; Cursor = Cursors.Default; Invalidate(); }
+            // fare ustundeyken kapanmaz; ayrilinca biraz daha bekler (ayrintilar aciksa 10 sn)
+            DelayClose(_st.Expanded ? 10 : 1.5);
         }
 
         protected override void OnMouseUp(MouseEventArgs e)
         {
             base.OnMouseUp(e);
-            if (_finished && e.Button == MouseButtons.Left && ToastPainter.CloseRect(_sc).Contains(e.Location)) BeginClose();
+            if (!_finished || e.Button != MouseButtons.Left) return;
+            if (ToastPainter.CloseRect(_sc).Contains(e.Location)) BeginClose();
+            else if (_st.Rows.Count > 0 && ToastPainter.DetailsRect(_sc).Contains(e.Location)) ToggleDetails();
+        }
+
+        // ayrintilar acilinca pencere yukari dogru uzar (alt kenar yerinde kalir)
+        private void ToggleDetails()
+        {
+            _st.Expanded = !_st.Expanded;
+            int h = (int)Math.Round(ToastPainter.HeightFor(_st) * _sc);
+            SetBounds(Left, _bottom - h, Width, h);
+            _homeTop = _bottom - h;
+            DelayClose(_st.Expanded ? 10 : 1.5);
+            Invalidate();
+        }
+
+        private void DelayClose(double seconds)
+        {
+            if (!_finished) return;
+            var t = DateTime.Now.AddSeconds(seconds);
+            if (_closeAt < t) _closeAt = t;
         }
 
         private void OnAnim()
@@ -851,7 +1103,7 @@ namespace SPCleanerPlus
             }
             if (repaint) Invalidate();
 
-            if (_finished && !_hover && now >= _closeAt) BeginClose();
+            if (_finished && !_hover && now >= _closeAt) BeginClose();   // fare ustundeyken (ayrintilar acik olsa da) kapanmaz
         }
 
         private async Task RunAsync()
@@ -920,6 +1172,18 @@ namespace SPCleanerPlus
         private void Finish()
         {
             _finished = true;
+            _st.Rows.Clear();
+            foreach (var src in _engine.Sources)
+            {
+                long v = _s.Preview ? src.Found : src.Freed;
+                _st.Rows.Add(new ToastRow
+                {
+                    Label = src.Label,
+                    Value = src.Skip != null ? "atlandı" : Util.HumanSize(v),
+                    Note = src.Skip != null ? Cap(src.Skip) : "",
+                    Dim = src.Skip != null || v == 0
+                });
+            }
             double sec = _s.AutoCloseSeconds <= 0 ? 1.5 : _s.AutoCloseSeconds;
             _closeAt = DateTime.Now.AddSeconds(sec);
             Invalidate();
@@ -934,15 +1198,16 @@ namespace SPCleanerPlus
         }
 
         private static string Num(int n) { return n.ToString("N0", Tr); }
+        private static string Cap(string t) { return t.Length == 0 ? t : char.ToUpper(t[0], Tr) + t.Substring(1); }
 
         public int ExitCode
         {
             get
             {
                 if (_engine == null) return 0;
-                if (_s.Preview) return _engine.TotalFiles > 0 ? 0 : 2;   // sessiz moddaki onizleme ile ayni
+                if (_s.Preview) return _engine.TotalBytes > 0 || _engine.TotalFiles > 0 ? 0 : 2;   // sessiz moddaki onizleme ile ayni
                 if (_engine.Errors > 0) return 1;
-                if (_engine.FilesDeleted == 0 && _engine.FoldersDeleted == 0 && _engine.ScheduledForReboot == 0) return 2;
+                if (_engine.FilesDeleted == 0 && _engine.FoldersDeleted == 0 && _engine.ScheduledForReboot == 0 && _engine.DeliveryFreed == 0) return 2;
                 return 0;
             }
         }
@@ -1019,12 +1284,12 @@ namespace SPCleanerPlus
                 if (s.Preview)
                 {
                     engine.WriteLog(targets);
-                    return engine.TotalFiles > 0 ? 0 : 2;
+                    return engine.TotalBytes > 0 || engine.TotalFiles > 0 ? 0 : 2;
                 }
                 engine.Clean(null, () => false);
                 engine.WriteLog(targets);
                 if (engine.Errors > 0) return 1;
-                if (engine.FilesDeleted == 0 && engine.FoldersDeleted == 0 && engine.ScheduledForReboot == 0) return 2;
+                if (engine.FilesDeleted == 0 && engine.FoldersDeleted == 0 && engine.ScheduledForReboot == 0 && engine.DeliveryFreed == 0) return 2;
                 return 0;
             }
             catch { return 1; }

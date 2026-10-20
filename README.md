@@ -15,6 +15,8 @@ birkaç saniye sonra kendiliğinden kapanır.
 | Diğer kullanıcıların `AppData\Local\Temp` klasörleri | Hepsi (yönetici izni gerekir) |
 | Windows hata raporları (WER: `ReportQueue`, `ReportArchive`, `Temp`) | Sadece **7 günden eski** olanlar |
 | Çökme dökümleri (`C:\Windows\Minidump`, `C:\Windows\MEMORY.DMP`, `AppData\Local\CrashDumps`) | Sadece **7 günden eski** olanlar |
+| Windows Update indirme önbelleği (`C:\Windows\SoftwareDistribution\Download`) | Sadece **7 günden eski** olanlar; Windows Update, BITS veya Windows Modules Installer çalışıyorsa ya da yeniden başlatma bekleniyorsa **hiç dokunulmaz** (yönetici izni gerekir) |
+| Teslim İyileştirme önbelleği | Windows'un kendi `Delete-DeliveryOptimizationCache` komutuyla; aktif bir indirme varsa atlanır (yönetici izni gerekir) |
 
 **Bilerek dokunulmayanlar:** Geri Dönüşüm Kutusu, tarayıcı önbellekleri, küçük resim/simge önbelleği,
 Prefetch, WinSxS, Installer önbelleği.
@@ -25,12 +27,13 @@ Prefetch, WinSxS, Installer önbelleği.
 - Junction/symlink bağlantılarının içine girilmez; sadece bağlantının kendisi kaldırılır.
 - Kullanımdaki (kilitli) dosyalar zorlanmaz; bir sonraki yeniden başlatmada silinmek üzere işaretlenir.
 - Önce `/PREVIEW` ile hiçbir şey silmeden ne silineceği görülebilir.
+- İş bitince bildirimdeki **Ayrıntılar** düğmesi her kaynaktan ne kadar silindiğini ve atlananların nedenini gösterir.
 
 ## Yönetici izni
 
 Program normal kullanıcı olarak açılır ve kendini Windows'un standart UAC onayıyla yönetici olarak yeniden başlatır
 (ikonda UAC kalkanı görünmez; UAC atlatılmaz). Onay verilmezse **sınırlı modda** çalışır: sadece kullanıcının kendi
-klasörlerini temizler ve başlıkta "(sinirli mod)" yazar.
+klasörlerini temizler; bildirimde sarı **"Sınırlı mod"** rozeti görünür.
 
 ## Kullanım
 
